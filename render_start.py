@@ -35,21 +35,26 @@ def start_bot():
     global bot_process
 
     session_path = BASE_DIR / "uploader.session"
-
-    if not session_path.exists():
-        secret_path = Path("/etc/secrets/uploader.session.b64")
-
-        if secret_path.is_file():
-            encoded = secret_path.read_text(encoding="ascii").strip()
-            session_data = base64.b64decode(encoded, validate=True)
-
+    secret_path = Path("/etc/secrets/uploader.session.b64")
+    
+    # Restore session from Render Secret File
+    if not session_path.exists() and secret_path.exists():
+        try:
+            session_data = base64.b64decode(
+                secret_path.read_text().strip(),
+                validate=True
+            )
+    
             session_path.write_bytes(session_data)
             os.chmod(session_path, 0o600)
-
-    if not session_path.is_file():
+    
+            print("Uploader session restored successfully.")
+    
+        except Exception as e:
+            raise RuntimeError(f"Failed to restore uploader session: {e}")
+    
+    if not session_path.exists():
         raise RuntimeError("uploader.session file is missing")
-
-        
 
     else:
         session_path = BASE_DIR / "uploader.session"
