@@ -37,6 +37,16 @@ def start_bot():
     session_path = BASE_DIR / "uploader.session"
 
     if not session_path.exists():
+        secret_path = Path("/etc/secrets/uploader.session.b64")
+
+        if secret_path.is_file():
+            encoded = secret_path.read_text(encoding="ascii").strip()
+            session_data = base64.b64decode(encoded, validate=True)
+
+            session_path.write_bytes(session_data)
+            os.chmod(session_path, 0o600)
+
+    if not session_path.is_file():
         raise RuntimeError("uploader.session file is missing")
 
         
