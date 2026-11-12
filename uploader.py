@@ -5,6 +5,7 @@ import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from pyrogram import Client
@@ -12,6 +13,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
+import config
 from config import (
     API_HASH,
     API_ID,
@@ -28,17 +30,55 @@ logger = logging.getLogger(__name__)
 # Longest FloodWait worth sleeping through before giving up on an upload
 _MAX_FLOOD_WAIT = 600
 
-pyro = Client(
-    "uploader",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    # The session file lives next to the code, whatever the working directory
-    workdir=str(BASE_DIR),
-    # Pyrogram uploads one file at a time unless told otherwise
-    max_concurrent_transmissions=MAX_CONCURRENT_UPLOADS,
-    # Sleep through ordinary flood waits instead of failing the upload
-    sleep_threshold=180,
-)
+# Active relay channel ID (mutable if updated during interactive setup)
+current_relay_channel_id: int = RELAY_CHANNEL_ID or 0
+
+
+def _build_client(api_id: Optional[int], api_hash: Optional[str]) -> Client:
+    """Instantiate the Pyrogram Client with safe fallbacks if not configured yet."""
+    return Client(
+        "uploader",
+        api_id=api_id or 1,
+        api_hash=api_hash or "00000000000000000000000000000000",
+        workdir=str(BASE_DIR),
+        max_concurrent_transmissions=MAX_CONCURRENT_UPLOADS,
+        sleep_threshold=180,
+    )
+
+
+pyro: Client = _build_client(API_ID, API_HASH)
+
+
+def init_client(
+    api_id: int,
+    api_hash: str,
+    relay_channel_id: Optional[int] = None,
+    bot_token: Optional[str] = None,
+    session_string: Optional[str] = None,
+) -> Client:
+    """
+    Reconstruct the Pyrogram Client with verified credentials and update
+    the relay channel target. Called dynamically upon setup completion.
+    Supports Bot Token mode and Pyrogram Session String mode.
+    """
+    global pyro, current_relay_channel_id
+    if relay_channel_id is not None:
+        current_relay_channel_id = relay_channel_id
+
+    kwargs: dict = dict(
+        api_id=api_id,
+        api_hash=api_hash,
+        workdir=str(BASE_DIR),
+        max_concurrent_transmissions=MAX_CONCURRENT_UPLOADS,
+        sleep_threshold=180,
+    )
+    if bot_token:
+        kwargs["bot_token"] = bot_token
+    if session_string:
+        kwargs["session_string"] = session_string
+
+    pyro = Client("uploader", **kwargs)
+    return pyro
 
 
 class UploadCancelled(Exception):
@@ -50,23 +90,55 @@ async def prime_peer_cache() -> None:
     Iterate through the user account's dialogs so Pyrogram populates its
     SQLite peer cache. Without this, numeric channel IDs can't be resolved
     on a fresh session. Called once after pyro.start().
+
+    Skipped for bot accounts — bots resolve peers via get_chat() directly
+    without needing a dialog list.
     """
+    if pyro.me and getattr(pyro.me, "is_bot", False):
+        logger.info("Skipping peer cache priming for bot account.")
+        return
     logger.info("Priming Pyrogram peer cache from dialogs…")
     count = 0
-    async for dialog in pyro.get_dialogs():
-        count += 1
+    with contextlib.suppress(Exception):
+        async for dialog in pyro.get_dialogs():
+            count += 1
     logger.info("Peer cache primed: %d dialogs loaded", count)
 
 
 async def check_relay_channel() -> None:
     """Fail startup loudly if the uploader account can't reach the relay channel."""
+    target_id = current_relay_channel_id or RELAY_CHANNEL_ID
+    if not target_id:
+        raise RuntimeError("RELAY_CHANNEL_ID is not configured.")
+
+    # For bot accounts, Pyrogram's peer cache may be empty on a fresh session.
+    # Attempt to resolve the channel — bots that are admins can always do this.
     try:
-        chat = await pyro.get_chat(RELAY_CHANNEL_ID)
+        chat = await pyro.get_chat(target_id)
     except Exception as e:
-        raise RuntimeError(
-            f"The uploader account can't open the relay channel {RELAY_CHANNEL_ID} ({e}). "
-            "Make sure it has joined the channel as an admin and RELAY_CHANNEL_ID is right."
-        ) from e
+        err_str = str(e).lower()
+        # "Peer id invalid" means the bot hasn't cached this peer yet.
+        # Try the -100<id> → bare id conversion as a fallback.
+        if "peer" in err_str or "invalid" in err_str:
+            # Strip the -100 prefix to get the raw channel id and retry
+            raw_str = str(target_id).lstrip("-")
+            if raw_str.startswith("100"):
+                raw_str = raw_str[3:]
+            try:
+                bare_id = int(raw_str)
+                chat = await pyro.get_chat(bare_id)
+                logger.info("Resolved channel via bare ID %d", bare_id)
+            except Exception as e2:
+                raise RuntimeError(
+                    f"The uploader account can't open the relay channel {target_id} ({e2}). "
+                    "Make sure the bot/account is added to the channel as an admin and "
+                    "RELAY_CHANNEL_ID is correct."
+                ) from e2
+        else:
+            raise RuntimeError(
+                f"The uploader account can't open the relay channel {target_id} ({e}). "
+                "Make sure it has joined the channel as an admin and RELAY_CHANNEL_ID is right."
+            ) from e
     logger.info("Uploader account can reach relay channel %r", chat.title)
 
 
@@ -102,10 +174,11 @@ class _RateMeter:
 
 
 async def _send(result: DownloadResult, progress: Callable) -> Optional[Message]:
+    target_id = current_relay_channel_id or RELAY_CHANNEL_ID
     path = str(result.path)
     if result.is_audio:
         return await pyro.send_audio(
-            chat_id=RELAY_CHANNEL_ID,
+            chat_id=target_id,
             audio=path,
             duration=result.duration,
             title=result.title[:128],
@@ -115,7 +188,7 @@ async def _send(result: DownloadResult, progress: Callable) -> Optional[Message]
             progress=progress,
         )
     return await pyro.send_video(
-        chat_id=RELAY_CHANNEL_ID,
+        chat_id=target_id,
         video=path,
         duration=result.duration,
         width=result.width,
@@ -162,14 +235,16 @@ async def send_to_relay(
     the file to the end user via the Bot API. Raises UploadCancelled once
     cancel_event is set.
     """
-    logger.info("Uploading via MTProto is_audio=%s path=%s (%dx%d)",
-                result.is_audio, result.path, result.width, result.height)
+    logger.info(
+        "Uploading via MTProto is_audio=%s path=%s (%dx%d)",
+        result.is_audio, result.path, result.width, result.height,
+    )
     cancel_event = cancel_event or asyncio.Event()
     meter = _RateMeter()
 
     async def progress(current: int, total: int) -> None:
         if cancel_event.is_set():
-            pyro.stop_transmission()  # Pyrogram stops the upload and returns None
+            pyro.stop_transmission()
         if on_progress is not None:
             speed, eta = meter.update(current, total)
             on_progress(Progress("upload", done=current, total=total, speed=speed, eta=eta))
@@ -178,7 +253,6 @@ async def send_to_relay(
         if cancel_event.is_set():
             raise UploadCancelled()
         try:
-            # Fresh mtime keeps the stale-file sweep away while uploads queue up
             os.utime(result.path)
             msg = await _unless_cancelled(_send(result, progress), cancel_event)
         except FloodWait as e:
