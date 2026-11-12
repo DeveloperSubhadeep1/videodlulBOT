@@ -1,4 +1,4 @@
-"""Every message the bot sends, as Telegram HTML. Emojis come from emojis.py."""
+"""Every message the bot sends, as Telegram HTML."""
 
 import math
 from html import escape
@@ -9,14 +9,9 @@ from config import BOT_NAME, USER_DOWNLOADS_PER_HOUR
 from downloader import Progress, VideoInfo
 from emojis import tg_emoji as e
 
-# Keeps status messages readable when titles are long (e.g. TikTok descriptions)
-TITLE_LIMIT = 200
-
-# Captions allow 1024 characters; the title leaves room for the emoji
+TITLE_LIMIT = 150
 CAPTION_TITLE_LIMIT = 900
-
-# Width of the progress bar, in blocks
-_BAR_WIDTH = 12
+_BAR_LENGTH = 12
 
 GENERIC_ERROR = "Something went wrong. Please try again."
 DELIVERY_FAILED = "I couldn't send the file here. Please try again."
@@ -33,7 +28,7 @@ def _title(title: str, limit: int = TITLE_LIMIT) -> str:
 def _duration(seconds: float) -> str:
     hours, rest = divmod(max(0, round(seconds)), 3600)
     mins, secs = divmod(rest, 60)
-    return f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
+    return f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
 
 
 def _minutes(seconds: int) -> str:
@@ -42,7 +37,7 @@ def _minutes(seconds: int) -> str:
 
 
 def human_size(num_bytes: Optional[float]) -> str:
-    """Short file size, e.g. 820 KB, 45 MB, 3.2 MB, 1.4 GB."""
+    """Readable file size."""
     if num_bytes is None:
         return "?"
     size = float(num_bytes)
@@ -53,126 +48,153 @@ def human_size(num_bytes: Optional[float]) -> str:
     return f"{size:.1f} GB"
 
 
-# -- commands -----------------------------------------------------------------
+def _draw_bar(done: float, total: Optional[float], length: int = _BAR_LENGTH) -> str:
+    if not total or total <= 0:
+        return "▱" * length
+    fraction = min(max(done / total, 0.0), 1.0)
+    filled = round(fraction * length)
+    return "▰" * filled + "▱" * (length - filled)
+
+
+# -- Commands -----------------------------------------------------------------
 
 def start() -> str:
     return (
         f"{e('WELCOME')} <b>Welcome to {escape(BOT_NAME)}!</b>\n\n"
-        f"{e('LINK')} Send me a video link and I'll send it back as a video, "
-        "<b>MP3</b> or <b>FLAC</b>.\n\n"
-        f"Just paste a link to get started {e('POINT_DOWN')}"
+        f"{e('LINK')} Send me any video link from YouTube, TikTok, Instagram, Twitter, etc., "
+        "and I will send it back to you in high quality video or audio (MP3/FLAC)!\n\n"
+        f"Just paste your link below {e('POINT_DOWN')}"
     )
 
 
 def commands() -> list[tuple[str, str]]:
-    """Telegram's command menu (the "/" button): (command, description), plain text."""
     return [
-        ("start", "Welcome message"),
-        ("help", "How to use the bot"),
+        ("start", "Start the bot"),
+        ("help", "Help and features"),
     ]
 
 
 def help_text() -> str:
     limit_line = (
-        f"• Up to {USER_DOWNLOADS_PER_HOUR} new downloads per hour\n"
+        f"• Limit: Up to {USER_DOWNLOADS_PER_HOUR} downloads per hour\n"
         if USER_DOWNLOADS_PER_HOUR > 0 else ""
     )
     return (
         f"{e('QUESTION')} <b>How to use</b>\n\n"
-        "1. Paste or send a video link\n"
-        "2. Choose a video quality, or MP3 / FLAC for audio only — each button shows the file size\n"
-        "3. Watch the progress, or tap Cancel — I'll send the file right here\n\n"
-        f"{e('INFO')} <b>Good to know</b>\n"
-        f"• Files up to {round(downloader.upload_limit / 1024**3)} GB\n"
-        "• Videos someone downloaded before arrive instantly\n"
-        f"{limit_line}"
-        "• Private videos and live streams can't be downloaded\n"
-        "• Age-restricted videos need cookies set up by the bot owner\n\n"
+        "1. Send or paste any video link.\n"
+        "2. Choose your quality, or select MP3/FLAC for audio.\n"
+        "3. Watch live progress and receive your file directly in this chat!\n\n"
+        f"{e('INFO')} <b>Features</b>\n"
+        f"• Direct delivery of files up to <b>{round(downloader.upload_limit / 1024**3)} GB</b>\n"
+        "• Previously downloaded videos arrive instantly via smart cache\n"
+        f"{limit_line}\n"
         f"{e('KEYBOARD')} <b>Commands</b>\n"
-        "/start — Welcome message\n"
-        "/help — This help"
+        "/start — Start the bot\n"
+        "/help — How to use"
     )
 
 
 def no_link() -> str:
-    return f"{e('LINK')} Send me a link to a video and I'll download it for you."
+    return f"{e('LINK')} Send me a valid video link and I'll download it for you."
 
-
-# -- progress -----------------------------------------------------------------
 
 def fetching() -> str:
-    return f"{e('SEARCH')} Fetching video info…"
+    return f"{e('SEARCH')} <b>Scanning media info…</b>"
 
 
 _QUEUE_WAIT = {
-    "youtube": "my turn with YouTube",
-    "info": "a free slot",
-    "download": "a free download slot",
+    "youtube": "YouTube request queue",
+    "info": "a lookup slot",
+    "download": "a download slot",
 }
 
 
 def queued(queue: str, position: int) -> str:
-    return f"{e('HOURGLASS')} Waiting for {_QUEUE_WAIT.get(queue, 'my turn')} (position {position})…"
+    return f"{e('HOURGLASS')} <b>Queued for {_QUEUE_WAIT.get(queue, 'processing')}</b> (Position: #{position})…"
 
 
 def choose(info: VideoInfo) -> str:
-    duration = f"\n{e('TIMER')} {_duration(info.duration)}" if info.duration else ""
+    duration = f" | ⏱️ {_duration(info.duration)}" if info.duration else ""
     return (
-        f"{e('VIDEO')} <b>{_title(info.title)}</b>{duration}\n\n"
-        f"Choose a video quality, or MP3 / FLAC for audio {e('POINT_DOWN')}"
+        f"🎬 <b>{_title(info.title)}</b>{duration}\n\n"
+        f"Select your download format {e('POINT_DOWN')}"
     )
 
 
 def downloading(title: str, label: str) -> str:
     return (
-        f"{e('DOWNLOAD')} Downloading <b>{_title(title)}</b> as <b>{escape(label)}</b>…\n\n"
-        "This may take a moment."
+        f"📥 <b>DOWNLOADING MEDIA</b>\n"
+        f"🎬 <b>Title:</b> <i>{_title(title)}</i>\n"
+        f"🎯 <b>Format:</b> <code>{escape(label)}</code>\n\n"
+        f"<code>[{_draw_bar(0, 100)}] 0%</code>\n\n"
+        f"⚡ <i>Initializing connection…</i>"
     )
 
 
 def uploading(title: str) -> str:
-    return f"{e('UPLOAD')} Uploading <b>{_title(title)}</b>…"
+    return (
+        f"🚀 <b>UPLOADING TO TELEGRAM</b>\n"
+        f"🎬 <b>Title:</b> <i>{_title(title)}</i>\n\n"
+        f"<code>[{_draw_bar(0, 100)}] 0%</code>\n\n"
+        f"⚡ <i>Preparing MTProto stream…</i>"
+    )
 
+
+# -- Creative Progress Dashboard ---------------------------------------------
 
 def progress(title: str, label: str, report: Progress) -> str:
-    """Status message with a progress bar, amount, speed and time left."""
+    """Creative, dynamic visual dashboard for download/processing/upload."""
     if report.stage == "upload":
-        head = f"{e('UPLOAD')} Uploading <b>{_title(title)}</b>"
+        header = "🚀 <b>UPLOADING TO TELEGRAM</b>"
+        icon_type = "📦"
     elif report.stage == "process":
-        head = f"{e('GEAR')} {escape(report.detail or 'Processing')} — <b>{_title(title)}</b>"
+        header = f"⚙️ <b>{escape(report.detail or 'PROCESSING MEDIA')}</b>"
+        icon_type = "⏱️"
     else:
-        part = f" (part {report.part} of {report.parts})" if report.parts > 1 else ""
-        head = f"{e('DOWNLOAD')} Downloading <b>{_title(title)}</b> as <b>{escape(label)}</b>{part}"
+        part_str = f" (Part {report.part}/{report.parts})" if report.parts > 1 else ""
+        header = f"📥 <b>DOWNLOADING MEDIA{part_str}</b>"
+        icon_type = "📦"
 
-    lines = [head]
-    if report.total:
-        fraction = min(max(report.done / report.total, 0.0), 1.0)
-        filled = round(fraction * _BAR_WIDTH)
-        amount = (
-            f"{_duration(report.done)} of {_duration(report.total)}"
-            if report.stage == "process"
-            else f"{human_size(report.done)} of {human_size(report.total)}"
-        )
-        lines += ["", f"<code>{'●●●' * filled}{'◎◎◎' * (_BAR_WIDTH - filled)}</code> {fraction:.0%}", amount]
-    elif report.stage != "process" and report.done:
-        lines += ["", f"{human_size(report.done)} so far"]
+    bar = _draw_bar(report.done, report.total)
 
-    extras = []
+    if report.total and report.total > 0:
+        percent = min(max(report.done / report.total, 0.0), 1.0) * 100
+        progress_line = f"<code>[{bar}] {percent:.1f}%</code>"
+        if report.stage == "process":
+            size_str = f"{_duration(report.done)} / {_duration(report.total)}"
+        else:
+            size_str = f"{human_size(report.done)} / {human_size(report.total)}"
+    elif report.done:
+        progress_line = f"<code>[{bar}]</code>"
+        size_str = f"{human_size(report.done)} processed"
+    else:
+        progress_line = f"<code>[{bar}] Starting...</code>"
+        size_str = "Calculating..."
+
+    stats = []
     if report.speed and report.stage != "process":
-        extras.append(f"{e('ZAP')} {human_size(report.speed)}/s")
+        stats.append(f"⚡ <b>Speed:</b> {human_size(report.speed)}/s")
     if report.eta is not None:
-        extras.append(f"{e('TIMER')} {_duration(report.eta)} left")
-    if extras:
-        lines.append("   ".join(extras))
-    return "\n".join(lines)
+        stats.append(f"⏱️ <b>ETA:</b> {_duration(report.eta)}")
+
+    stats_block = "\n".join(stats) if stats else "⚡ <b>Status:</b> Streaming data…"
+
+    return (
+        f"{header}\n"
+        f"🎬 <b>Title:</b> <i>{_title(title, 80)}</i>\n"
+        f"🎯 <b>Format:</b> <code>{escape(label)}</code>\n\n"
+        f"{progress_line}\n\n"
+        f"{icon_type} <b>Size:</b> {size_str}\n"
+        f"{stats_block}"
+    )
 
 
 def done(title: str) -> str:
-    return f"{e('CHECK')} Done! Enjoy <b>{_title(title)}</b> {e('ENJOY')}"
+    return f"{e('CHECK')} <b>Complete!</b> Enjoy <b>{_title(title)}</b> {e('ENJOY')}"
 
 
 def done_instantly(title: str) -> str:
-    return f"{e('ZAP')} Sent instantly — <b>{_title(title)}</b> was downloaded before."
+    return f"{e('ZAP')} <b>Instant Delivery!</b> <b>{_title(title)}</b> was cached in high speed."
 
 
 def caption(title: str, is_audio: bool) -> str:
@@ -180,15 +202,14 @@ def caption(title: str, is_audio: bool) -> str:
 
 
 def cancelling() -> str:
-    """Callback toast (plain text) while a download stops."""
-    return "Cancelling…"
+    return "Cancelling download…"
 
 
 def cancelled(title: str) -> str:
-    return f"{e('CROSS')} Cancelled <b>{_title(title)}</b>. Pick another option or send a new link."
+    return f"{e('CROSS')} Cancelled <b>{_title(title)}</b>. Choose another format or send a new link."
 
 
-# -- problems -----------------------------------------------------------------
+# -- Errors ------------------------------------------------------------------
 
 def error(message: str) -> str:
     return f"{e('CROSS')} {escape(message)}"
@@ -199,32 +220,24 @@ def menu_expired() -> str:
 
 
 def restarting() -> str:
-    return f"{e('WARNING')} The bot is restarting. Please send the link again in a minute."
+    return f"{e('WARNING')} The service is refreshing. Please resend the link in a moment."
 
 
 def lookup_limit(wait_seconds: int) -> str:
-    return (
-        f"{e('HOURGLASS')} You've sent a lot of links this hour. "
-        f"Please try again in {_minutes(wait_seconds)}."
-    )
+    return f"{e('HOURGLASS')} Lookup limit reached. Please wait {_minutes(wait_seconds)}."
 
-
-# Callback alerts are plain text (no HTML or custom emoji), max 200 characters
 
 def busy_alert() -> str:
-    return "⏳ You already have a download in progress. Please wait for it to finish."
+    return "⏳ You already have an active download in progress."
 
 
 def download_limit_alert(wait_seconds: Optional[int]) -> str:
-    return (
-        f"⏳ You've reached {USER_DOWNLOADS_PER_HOUR} downloads this hour. "
-        f"Try again in {_minutes(wait_seconds or 60)}."
-    )
+    return f"⏳ Download limit reached. Try again in {_minutes(wait_seconds or 60)}."
 
 
 def nothing_to_cancel() -> str:
-    return "This download has already finished."
+    return "This job has already finished."
 
 
 def not_your_download() -> str:
-    return "Only the person who started this download can cancel it."
+    return "Only the person who initiated this download can cancel it."

@@ -94,7 +94,11 @@ if PROXY_URL:
     if not PROXY_SITES:
         config_error("PROXY_URL is set but PROXY_SITES is empty: list the sites that should use it. See README, 'Configuration'.")
 
-TEMP_DIR: Path = Path("/tmp/video-downloader")
+TEMP_DIR: Path = (
+    Path(os.environ.get("TEMP_DIR", ""))
+    if os.environ.get("TEMP_DIR")
+    else Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "video-downloader"
+)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 DOWNLOAD_TIMEOUT: int = 1800

@@ -6,157 +6,59 @@ import re
 import time
 from collections import deque
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Tuple
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
-import config
 from config import (
     API_HASH,
     API_ID,
-    BASE_DIR,
+    BOT_TOKEN,
     MAX_CONCURRENT_UPLOADS,
     MAX_UPLOAD_BYTES,
-    PREMIUM_MAX_UPLOAD_BYTES,
-    RELAY_CHANNEL_ID,
 )
 from downloader import DownloadResult, OnProgress, Progress
 
 logger = logging.getLogger(__name__)
 
-# Longest FloodWait worth sleeping through before giving up on an upload
 _MAX_FLOOD_WAIT = 600
 
-# Active relay channel ID (mutable if updated during interactive setup)
-current_relay_channel_id: int = RELAY_CHANNEL_ID or 0
 
-
-def _build_client(api_id: Optional[int], api_hash: Optional[str]) -> Client:
-    """Instantiate the Pyrogram Client with safe fallbacks if not configured yet."""
+def _build_client() -> Client:
+    """Build Pyrogram MTProto bot client in memory."""
     return Client(
-        "uploader",
-        api_id=api_id or 1,
-        api_hash=api_hash or "00000000000000000000000000000000",
-        workdir=str(BASE_DIR),
+        "uploader_bot",
+        api_id=API_ID or 1,
+        api_hash=API_HASH or "00000000000000000000000000000000",
+        bot_token=BOT_TOKEN,
+        in_memory=True,
         max_concurrent_transmissions=MAX_CONCURRENT_UPLOADS,
         sleep_threshold=180,
     )
 
 
-pyro: Client = _build_client(API_ID, API_HASH)
-
-
-def init_client(
-    api_id: int,
-    api_hash: str,
-    relay_channel_id: Optional[int] = None,
-    bot_token: Optional[str] = None,
-    session_string: Optional[str] = None,
-) -> Client:
-    """
-    Reconstruct the Pyrogram Client with verified credentials and update
-    the relay channel target. Called dynamically upon setup completion.
-    Supports Bot Token mode and Pyrogram Session String mode.
-    """
-    global pyro, current_relay_channel_id
-    if relay_channel_id is not None:
-        current_relay_channel_id = relay_channel_id
-
-    kwargs: dict = dict(
-        api_id=api_id,
-        api_hash=api_hash,
-        workdir=str(BASE_DIR),
-        max_concurrent_transmissions=MAX_CONCURRENT_UPLOADS,
-        sleep_threshold=180,
-    )
-    if bot_token:
-        kwargs["bot_token"] = bot_token
-    if session_string:
-        kwargs["session_string"] = session_string
-
-    pyro = Client("uploader", **kwargs)
-    return pyro
+pyro: Client = _build_client()
 
 
 class UploadCancelled(Exception):
     """The user cancelled while the file was uploading."""
 
 
-async def prime_peer_cache() -> None:
-    """
-    Iterate through the user account's dialogs so Pyrogram populates its
-    SQLite peer cache. Without this, numeric channel IDs can't be resolved
-    on a fresh session. Called once after pyro.start().
-
-    Skipped for bot accounts — bots resolve peers via get_chat() directly
-    without needing a dialog list.
-    """
-    if pyro.me and getattr(pyro.me, "is_bot", False):
-        logger.info("Skipping peer cache priming for bot account.")
-        return
-    logger.info("Priming Pyrogram peer cache from dialogs…")
-    count = 0
-    with contextlib.suppress(Exception):
-        async for dialog in pyro.get_dialogs():
-            count += 1
-    logger.info("Peer cache primed: %d dialogs loaded", count)
-
-
-async def check_relay_channel() -> None:
-    """Fail startup loudly if the uploader account can't reach the relay channel."""
-    target_id = current_relay_channel_id or RELAY_CHANNEL_ID
-    if not target_id:
-        raise RuntimeError("RELAY_CHANNEL_ID is not configured.")
-
-    # For bot accounts, Pyrogram's peer cache may be empty on a fresh session.
-    # Attempt to resolve the channel — bots that are admins can always do this.
-    try:
-        chat = await pyro.get_chat(target_id)
-    except Exception as e:
-        err_str = str(e).lower()
-        # "Peer id invalid" means the bot hasn't cached this peer yet.
-        # Try the -100<id> → bare id conversion as a fallback.
-        if "peer" in err_str or "invalid" in err_str:
-            # Strip the -100 prefix to get the raw channel id and retry
-            raw_str = str(target_id).lstrip("-")
-            if raw_str.startswith("100"):
-                raw_str = raw_str[3:]
-            try:
-                bare_id = int(raw_str)
-                chat = await pyro.get_chat(bare_id)
-                logger.info("Resolved channel via bare ID %d", bare_id)
-            except Exception as e2:
-                raise RuntimeError(
-                    f"The uploader account can't open the relay channel {target_id} ({e2}). "
-                    "Make sure the bot/account is added to the channel as an admin and "
-                    "RELAY_CHANNEL_ID is correct."
-                ) from e2
-        else:
-            raise RuntimeError(
-                f"The uploader account can't open the relay channel {target_id} ({e}). "
-                "Make sure it has joined the channel as an admin and RELAY_CHANNEL_ID is right."
-            ) from e
-    logger.info("Uploader account can reach relay channel %r", chat.title)
-
-
 def upload_limit() -> int:
-    """Largest file the uploader account may send (higher with Telegram Premium)."""
-    return PREMIUM_MAX_UPLOAD_BYTES if pyro.me and pyro.me.is_premium else MAX_UPLOAD_BYTES
+    """Bots uploading over MTProto support files up to 2,000 MiB (2 GB)."""
+    return MAX_UPLOAD_BYTES  # 2000 MiB
 
 
 def _file_name(title: str, suffix: str) -> str:
-    """File name users see in Telegram, built from the video title."""
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", title)
     name = re.sub(r"\s+", " ", name).strip()[:100] or "video"
     return f"{name}{suffix}"
 
 
 class _RateMeter:
-    """Transfer speed over the last few seconds, and the time left at that speed."""
-
     def __init__(self, window: float = 5.0):
         self._window = window
         self._samples: deque[tuple[float, int]] = deque()
@@ -173,40 +75,47 @@ class _RateMeter:
         return speed, (total - done) / speed if total else None
 
 
-async def _send(result: DownloadResult, progress: Callable) -> Optional[Message]:
-    target_id = current_relay_channel_id or RELAY_CHANNEL_ID
+async def _send_direct(
+    chat_id: int,
+    thread_id: Optional[int],
+    result: DownloadResult,
+    progress: Callable,
+    caption: str,
+) -> Message:
+    """Send directly to the user via MTProto."""
     path = str(result.path)
+
     if result.is_audio:
         return await pyro.send_audio(
-            chat_id=target_id,
+            chat_id=chat_id,
             audio=path,
+            caption=caption,
             duration=result.duration,
             title=result.title[:128],
             performer=result.uploader,
             file_name=_file_name(result.title, result.path.suffix),
-            parse_mode=ParseMode.DISABLED,
+            parse_mode=ParseMode.HTML,
+            message_thread_id=thread_id,
             progress=progress,
         )
+
     return await pyro.send_video(
-        chat_id=target_id,
+        chat_id=chat_id,
         video=path,
+        caption=caption,
         duration=result.duration,
         width=result.width,
         height=result.height,
         thumb=str(result.thumb) if result.thumb else None,
         file_name=_file_name(result.title, result.path.suffix),
-        parse_mode=ParseMode.DISABLED,
+        parse_mode=ParseMode.HTML,
         supports_streaming=True,
+        message_thread_id=thread_id,
         progress=progress,
     )
 
 
 async def _unless_cancelled(work: Awaitable, cancel_event: asyncio.Event):
-    """
-    Await `work`, but stop it and raise UploadCancelled as soon as cancel_event
-    is set — including while it waits for a free upload slot, sleeps through a
-    flood wait, or sends the final message after the last chunk.
-    """
     task = asyncio.ensure_future(work)
     waiter = asyncio.ensure_future(cancel_event.wait())
     try:
@@ -224,21 +133,19 @@ async def _unless_cancelled(work: Awaitable, cancel_event: asyncio.Event):
     return task.result()
 
 
-async def send_to_relay(
+async def send_to_user(
+    chat_id: int,
+    thread_id: Optional[int],
     result: DownloadResult,
+    caption: str,
     on_progress: Optional[OnProgress] = None,
     cancel_event: Optional[asyncio.Event] = None,
-) -> Message:
+) -> Tuple[Message, str, str]:
     """
-    Upload a downloaded file to the relay channel via the user account
-    (MTProto). Returns the Pyrogram Message object — its .id is used to copy
-    the file to the end user via the Bot API. Raises UploadCancelled once
-    cancel_event is set.
+    Directly upload the file to the user over MTProto.
+    Returns (message, file_id, file_type).
     """
-    logger.info(
-        "Uploading via MTProto is_audio=%s path=%s (%dx%d)",
-        result.is_audio, result.path, result.width, result.height,
-    )
+    logger.info("Direct MTProto upload to user chat=%s path=%s", chat_id, result.path)
     cancel_event = cancel_event or asyncio.Event()
     meter = _RateMeter()
 
@@ -254,29 +161,42 @@ async def send_to_relay(
             raise UploadCancelled()
         try:
             os.utime(result.path)
-            msg = await _unless_cancelled(_send(result, progress), cancel_event)
+            msg = await _unless_cancelled(
+                _send_direct(chat_id, thread_id, result, progress, caption),
+                cancel_event,
+            )
         except FloodWait as e:
             wait = int(e.value)
             if attempt == 2 or wait > _MAX_FLOOD_WAIT:
-                logger.warning("Upload rate-limited by Telegram for %ss; giving up", wait)
-                raise RuntimeError(
-                    "Telegram is limiting uploads right now. Please try again in a few minutes."
-                ) from e
-            logger.warning("Upload rate-limited by Telegram; retrying in %ss", wait)
+                logger.warning("Upload flood-wait %ss; giving up", wait)
+                raise RuntimeError("Telegram is limiting uploads right now. Please try again shortly.") from e
+            logger.warning("Upload rate-limited; retrying in %ss", wait)
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 continue
             raise UploadCancelled() from e
         except UploadCancelled:
-            logger.info("Upload cancelled by the user")
+            logger.info("Upload cancelled by user")
             raise
         except Exception as e:
-            logger.exception("MTProto upload failed")
-            raise RuntimeError("The upload to Telegram failed. Please try again.") from e
+            logger.exception("Direct upload failed")
+            raise RuntimeError(f"Failed to send file directly to chat: {e}") from e
+
         if msg is None:
-            logger.info("Upload cancelled by the user")
             raise UploadCancelled()
-        logger.info("MTProto upload complete: channel message_id=%s", msg.id)
-        return msg
+
+        # Extract file_id for instant future caching
+        if msg.video:
+            file_id = msg.video.file_id
+            file_type = "video"
+        elif msg.audio:
+            file_id = msg.audio.file_id
+            file_type = "audio"
+        else:
+            file_id = msg.document.file_id
+            file_type = "document"
+
+        return msg, file_id, file_type
+
     raise AssertionError("unreachable")
